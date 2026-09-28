@@ -11,7 +11,6 @@ heard, coloured by how recently, the radios they are, and the public chat. No ra
 - **ANSI** callers get the same map in 24-bit half blocks at 79x24, a node list with find (/), a sensor view (E),
   distances or link counts, the chat (F filter, Tab channel) and a stats page (S). Keyboard only.
 - **Home:** a caller's town comes from the Weather door's saves (H goes there); without one, H says how to set it.
-- **News screen:** `news/newsstats.py` shows "Mesh: N radios" on row 24 when the listening post ran in the last day.
 
 ## How it works
 
