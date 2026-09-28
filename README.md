@@ -13,8 +13,6 @@ heard, coloured by how recently, the radios they are, and the public chat. No ra
 - **Home:** a caller's town comes from the Weather door's saves (H goes there); without one, H says how to set it.
 - **News screen:** `news/newsstats.py` shows "Mesh: N radios" on row 24 when the listening post ran in the last day.
 
-Design doc: https://claude.ai/code/artifact/d815a54e-0849-49c0-bdff-8dc391507689
-
 ## How it works
 
 | Piece | Where | What |
