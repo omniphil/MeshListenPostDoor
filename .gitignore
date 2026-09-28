@@ -1,0 +1,11 @@
+door/obj/
+door/native/
+door/lpdoor
+collector/lpcollect
+module/src/states_blob.h
+data/*
+!data/states.bin
+saves/
+lp.ini
+*.wasm
+__pycache__/

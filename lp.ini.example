@@ -1,0 +1,25 @@
+# lp.ini -- the Meshtastic Listening Post. Beside lpdoor and lpcollect.
+# Every line is optional; these are the defaults.
+
+# How long the collector keeps listening after the last caller leaves.
+linger_minutes = 15
+
+# Nodes not heard for this many days drop off the map (and out of the snapshot).
+node_days = 7
+
+# Public chat lines kept.
+chat_lines = 200
+
+# The Weather door's saves folder: a caller's town comes from there (home, distances).
+# Default: ../weather/saves beside this door.
+# weather_saves = /home/phil/mystic/doors/weather/saves
+
+# Where a caller starts the first time: all, or a state's name or two letters (GA, Georgia).
+default_region = all
+
+# The public Meshtastic feed. Change only if you know why.
+mqtt_host = mqtt.meshtastic.org
+mqtt_port = 1883
+mqtt_topic = msh/US/#
+mqtt_user = meshdev
+mqtt_pass = large4cats
