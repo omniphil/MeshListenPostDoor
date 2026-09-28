@@ -52,10 +52,10 @@ make -C module                           # lp.wasm (wasi-sdk 34+ in ~/tools)
 make -C door bundle                      # snapshot the shared headers into door/native for the BBS
 ```
 
-On the BBS, `/home/phil/mystic/doors/listenpost/` holds `lpdoor`, `lpcollect`, `lp.wasm`, `states.bin` and `lp.ini`
+On the BBS, `/home/user/mystic/doors/listenpost/` holds `lpdoor`, `lpcollect`, `lp.wasm`, `states.bin` and `lp.ini`
 (from `lp.ini.example`), with write access for `data/` and `saves/`. The collector needs outbound TCP 1883.
 
-Mystic menu command: `D3` with data `./doors/listenpost/lpdoor /home/phil/mystic/temp%3`.
+Mystic menu command: `D3` with data `./doors/listenpost/lpdoor /home/user/mystic/temp%3`.
 
 ## Keys
 
