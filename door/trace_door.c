@@ -12,6 +12,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 #include "trace_door.h"
 #include "door.h"
@@ -387,32 +390,156 @@ const char *tdoor_info(void)
     return clean;
 }
 
+/* ---- gzip uploads ---- */
+
+/*
+ * A TERMinator that lists gz=1 in its Query reply takes an upload as one gzip stream (ENGINE.md "Gzip uploads"):
+ * every Put of it says enc=gz, offset counts the compressed bytes, and Open/Asset still give the real file's size and
+ * sha256. zlib is loaded at run time (dlopen libz.so.1), so a door needs no zlib headers to build and simply sends raw
+ * where there is no zlib. The stream is made once per file per run (level 9; DOOM's WAD takes about half a second on
+ * the box, Duke's 17 MB pak two) and kept. A file gzip shrinks by less than a tenth (zips, JPEG XL, packs of either)
+ * goes raw, as before; above 4 MB a 1 MB sample from its middle decides that first, so a big zip costs no full pass.
+ */
+typedef int (*tdoor_z_compress2)(unsigned char *dest, unsigned long *dest_len, const unsigned char *src,
+                                 unsigned long src_len, int level);
+typedef unsigned long (*tdoor_z_bound)(unsigned long src_len);
+typedef unsigned long (*tdoor_z_crc32)(unsigned long crc, const unsigned char *buf, unsigned int len);
+
+static tdoor_z_compress2 z_compress2;
+static tdoor_z_bound     z_bound;
+static tdoor_z_crc32     z_crc32;
+
+static bool zlib_ready(void)
+{
+#ifdef _WIN32
+    return false;
+#else
+    static int state;   /* 0 not tried, 1 loaded, -1 not there */
+    if (state == 0) {
+        void *lib = dlopen("libz.so.1", RTLD_NOW | RTLD_LOCAL);
+        void *c = lib ? dlsym(lib, "compress2") : NULL, *b = lib ? dlsym(lib, "compressBound") : NULL,
+             *r = lib ? dlsym(lib, "crc32") : NULL;
+        if (c != NULL && b != NULL && r != NULL) {
+            memcpy(&z_compress2, &c, sizeof(c));
+            memcpy(&z_bound, &b, sizeof(b));
+            memcpy(&z_crc32, &r, sizeof(r));
+            state = 1;
+        } else {
+            state = -1;
+        }
+    }
+    return state == 1;
+#endif
+}
+
+/* Whether gzip shrinks a 1 MB sample from the middle of data by at least a tenth (a quick pass, level 1). */
+static bool worth_gzip(const uint8_t *data, size_t size)
+{
+    size_t len = 1024 * 1024, from = size > len ? (size - len) / 2 : 0;
+    if (len > size) len = size;
+    unsigned long out_len = z_bound((unsigned long)len);
+    uint8_t *out = (uint8_t *)malloc(out_len);
+    bool worth = false;
+    if (out != NULL && z_compress2(out, &out_len, data + from, (unsigned long)len, 1) == 0)
+        worth = out_len <= len - len / 10;
+    free(out);
+    return worth;
+}
+
+/* data as a gzip stream: zlib's deflate between a gzip header and a CRC-32 + size trailer. NULL when it saves less
+ * than a tenth, or there's no zlib or memory. */
+static uint8_t *make_gzip(const uint8_t *data, size_t size, size_t *gz_len)
+{
+    if (size == 0 || size > 0xFFFFFFFFul || (size > 4 * 1024 * 1024 && !worth_gzip(data, size)))
+        return NULL;
+    unsigned long z_len = z_bound((unsigned long)size);
+    uint8_t *out = (uint8_t *)malloc(10 + z_len + 8);
+    if (out == NULL)
+        return NULL;
+    /* compress2 writes a zlib stream (2-byte header, raw deflate, 4-byte Adler-32) at out + 8, so the deflate data
+     * starts at out + 10, right after the 10-byte gzip header written over the front afterwards */
+    if (z_compress2(out + 8, &z_len, data, (unsigned long)size, 9) != 0 || z_len < 6) {
+        free(out);
+        return NULL;
+    }
+    size_t deflate_len = z_len - 6, total = 10 + deflate_len + 8;
+    if (total > size - size / 10) {
+        free(out);
+        return NULL;
+    }
+    static const uint8_t header[10] = { 0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 2, 3 };   /* deflate, no name/time, -9, Unix */
+    memcpy(out, header, sizeof(header));
+    unsigned long crc = z_crc32(0, NULL, 0);
+    for (size_t off = 0; off < size; off += 1u << 30) {
+        size_t n = size - off < (1u << 30) ? size - off : (1u << 30);
+        crc = z_crc32(crc, data + off, (unsigned int)n);
+    }
+    uint8_t *t = out + 10 + deflate_len;
+    for (int i = 0; i < 4; i++) {
+        t[i] = (uint8_t)(crc >> (8 * i));
+        t[4 + i] = (uint8_t)((uint32_t)size >> (8 * i));
+    }
+    *gz_len = total;
+    return out;
+}
+
+/* What upload() sends for blob: its gzip stream when the terminal said gz=1 and that pays, else NULL (send it raw).
+ * Kept by hash, so a file is compressed (or found not worth it) once per run. */
+static const uint8_t *gzip_for(const tdoor_blob_t *blob, size_t *gz_len)
+{
+    static struct { char hash[65]; uint8_t *data; size_t len; } cache[8];
+    static int next;
+
+    if (!tdoor_has("gz=1") || blob->size == 0 || !zlib_ready())
+        return NULL;
+    for (int i = 0; i < 8; i++)
+        if (cache[i].hash[0] != '\0' && strcmp(cache[i].hash, blob->hash) == 0) {
+            *gz_len = cache[i].len;
+            return cache[i].data;
+        }
+    int slot = next;
+    next = (next + 1) % 8;
+    free(cache[slot].data);
+    cache[slot].data = make_gzip(blob->data, blob->size, &cache[slot].len);
+    snprintf(cache[slot].hash, sizeof(cache[slot].hash), "%s", blob->hash);
+    *gz_len = cache[slot].len;
+    return cache[slot].data;
+}
+
 /* ---- sending ---- */
 
-/* Sends one blob in Put chunks, then PutDone. asset_hash is NULL for the module itself. */
+/* Sends one blob in Put chunks, then PutDone. asset_hash is NULL for the module itself. As a gzip stream (enc=gz on
+ * every Put, offsets in compressed bytes) when gzip_for says so; never a mix of the two in one upload. */
 static void upload(const tdoor_blob_t *blob, const char *asset_hash, void (*progress)(int))
 {
     char head[256];
     int last_percent = -1;
     size_t chunk = g_binary ? BIN_CHUNK : B64_CHUNK;
+    size_t size = 0;
+    const uint8_t *data = gzip_for(blob, &size);
+    const char *enc = data != NULL ? ";enc=gz" : "";
 
-    for (size_t off = 0; off < blob->size; off += chunk) {
-        size_t len = blob->size - off < chunk ? blob->size - off : chunk;
+    if (data == NULL) {
+        data = blob->data;
+        size = blob->size;
+    }
+    for (size_t off = 0; off < size; off += chunk) {
+        size_t len = size - off < chunk ? size - off : chunk;
         if (asset_hash)
-            snprintf(head, sizeof(head), "Put;module=%s;asset=%s;offset=%zu", g_module, asset_hash, off);
+            snprintf(head, sizeof(head), "Put;module=%s;asset=%s%s;offset=%zu", g_module, asset_hash, enc, off);
         else
-            snprintf(head, sizeof(head), "Put;module=%s;offset=%zu", g_module, off);
+            snprintf(head, sizeof(head), "Put;module=%s%s;offset=%zu", g_module, enc, off);
         if (g_binary) {
-            write_frame(head, blob->data + off, len);
+            write_frame(head, data + off, len);
         } else {
             door_write(APC);
             door_write(head);
             door_write(";data=");
-            write_base64(blob->data + off, len);
+            write_base64(data + off, len);
             door_write(ST);
         }
         if (progress) {
-            int percent = (int)((off + len) * 100 / blob->size);
+            int percent = (int)((off + len) * 100 / size);
             if (percent != last_percent) {
                 progress(percent);
                 last_percent = percent;

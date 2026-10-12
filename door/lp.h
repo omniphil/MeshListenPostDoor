@@ -22,7 +22,7 @@ typedef struct {
 
 typedef struct {
     int    region;                   /* 0 = All US, 1.. = states.bin order */
-    int    display;                  /* start page: 1 TRACE, 2 ANSI, 0 none */
+    int    display;                  /* start page: 1 TRACE, 2 ANSI, 3 JPEG XL, 0 none */
     bool   haveHome;                 /* the caller told the Weather door their town */
     double homeLat, homeLon;
     char   homeName[64];
@@ -37,6 +37,8 @@ const char *lp_beside_exe(const char *name, char *out, size_t size);
 void lp_load_config(void);
 void lp_load_prefs(LpUserPrefs *p);
 void lp_save_prefs(const LpUserPrefs *p);
+/* A file in this caller's saves folder (made if need be), beside their prefs. */
+const char *lp_user_file(const char *name, char *out, size_t size);
 bool lp_load_states(void);
 
 /* "I'm here": makes this door's file in data/doors and starts the collector if

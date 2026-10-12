@@ -14,6 +14,10 @@
  * (ESC _ TERMinator:TRACE;Bin;<escaped bytes> ESC \) instead of base64, about 3.5% over the raw size instead of 33%,
  * and in 60 KB pieces instead of 3 KB. Older TERMinators get base64 as before. Nothing else changes for the door.
  *
+ * Gzip uploads: when the Query reply has gz=1, an upload goes as one gzip stream (enc=gz on every Put) if that saves
+ * at least a tenth; zips, pictures and the like still go raw. zlib is loaded at run time (libz.so.1), so a door
+ * needs no zlib to build and sends raw without it. Nothing changes for the door.
+ *
  * Needs the door's door.h (door_write, door_write_raw, door_read_char_timeout, door_time_remaining) and sha256.h.
  */
 

@@ -5,13 +5,15 @@
  * people's radios hear, what they are, and the public chat.
  *   TRACE  the door sends a module and the state outlines (once, cached);
  *          TERMinator draws a map you can zoom and pan, with keyboard and mouse.
+ *   JPEG XL the TRACE map drawn here on the BBS and sent as JPEG XL pictures,
+ *          for CTerm terminals that show them (pix_lp.c).
  *   ANSI   the same map in 24-bit half blocks, a node list and the chat.
  *
  * The collector (lpcollect) that listens to the feed runs only while someone is
  * using the door, and for an hour after: opening the door starts it.
  *
  * The same start menu as the Weather and Satellite doors: detect quietly, then
- * offer TRACE or ANSI, remembering the caller's choice.
+ * offer TRACE, JPEG XL or ANSI, remembering the caller's choice.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -23,14 +25,20 @@
 #include <time.h>
 
 #include "ansi_lp.h"
+#include "apc.h"
 #include "door.h"
+#include "jxl_enc.h"
+#include "link.h"
 #include "lp.h"
+#include "pix_lp.h"
 #include "trace_door.h"
 
 #define CSI "\033["
 #define MODULE_ID "listenpost"
 
-enum { CHOICE_TRACE = 1, CHOICE_ANSI = 2 };
+/* As kept in the prefs (display =): JPEG XL came later, so it's 3 there,
+ * though the menu shows it second. */
+enum { CHOICE_TRACE = 1, CHOICE_ANSI = 2, CHOICE_JXL = 3 };
 enum { TERM_PLAIN = 0, TERM_TRACE_OLD, TERM_TRACE };
 
 static LpUserPrefs g_prefs;
@@ -84,6 +92,81 @@ static int detect_terminal(void)
     return tdoor_has("mouse=1") ? TERM_TRACE : TERM_TRACE_OLD;
 }
 
+/* ---------------------------------------------------- the JPEG XL mode --- */
+
+static struct {
+    bool cterm, jxl;
+    bool old;           /* draws JPEG XL, but only through its cache (CTerm before 1.329): too slow here */
+    int  major, minor;
+    int  px_w, px_h;
+} g_cterm;
+
+/*
+ * A CTerm terminal answers "who are you" (ESC [ c) with ESC [ = 67;84;101;
+ * 114;109;<major>;<minor> c. Then, for one, whether it draws JPEG XL
+ * (Q;JXL -> ESC [ = 1 ; 1 - n) and its screen in pixels (ESC [ ? 2 ; 0 ; w ;
+ * h S), finished by a status request every terminal answers.
+ */
+static void detect_cterm(void)
+{
+    char reply[512];
+    int n = 0, c;
+    door_write(CSI "c");
+    c = door_read_char_timeout(500);
+    while (c >= 0 && n < 63) {
+        reply[n++] = (char)c;
+        if (c == 'c' && n > 2) break;
+        c = door_read_char_timeout(200);
+    }
+    reply[n] = 0;
+    const char *p = strstr(reply, "[=67;84;101;114;109;");
+    if (!p || sscanf(p + 20, "%d;%d", &g_cterm.major, &g_cterm.minor) != 2) return;
+    g_cterm.cterm = true;
+
+    door_write(APC_PREFIX "Q;JXL" APC_END CSI "?2;1S" CSI "5n");
+    n = 0;
+    c = door_read_char_timeout(1500);
+    while (c >= 0 && n < (int)sizeof reply - 1) {
+        reply[n++] = (char)c;
+        reply[n] = 0;
+        if (strstr(reply, "\033[0n")) break;
+        c = door_read_char_timeout(500);
+    }
+    reply[n] = 0;
+    g_cterm.jxl = strstr(reply, "\033[=1;1-n") != NULL && jxl_enc_available();
+    /* A terminal before CTerm 1.329 takes pictures only through its cache, a file written and read back for every
+     * frame: SyncTERM 1.8b managed 9 a second with stalls, and keys typed during them reached the BBS afterwards
+     * (2026-10-05). Those get ANSI. */
+    if (g_cterm.jxl && !(g_cterm.major > 1 || (g_cterm.major == 1 && g_cterm.minor >= 329))) {
+        g_cterm.jxl = false;
+        g_cterm.old = true;
+    }
+    p = strstr(reply, "\033[?2;0;");
+    if (!p || sscanf(p + 7, "%d;%d", &g_cterm.px_w, &g_cterm.px_h) != 2) {
+        g_cterm.px_w = 640;     /* 80x25 at 8x16, what nearly every CTerm terminal is */
+        g_cterm.px_h = 400;
+    }
+}
+
+static bool cterm_at_least(int major, int minor)
+{
+    return g_cterm.cterm && (g_cterm.major > major || (g_cterm.major == major && g_cterm.minor >= minor));
+}
+
+static int play_jxl(void)
+{
+    pix_caps_t caps = { cterm_at_least(1, 329), g_cterm.px_w, g_cterm.px_h };
+    title();
+    door_write(CSI "0;37m  Click a node to see it, drag to pan, the wheel or + / - to zoom. Arrows pan,\r\n"
+               "  Tab steps through the nodes, R picks a region, C opens the chat, S the stats,\r\n"
+               "  / finds a node, ? lists the keys -- and the key hints can be clicked.\r\n"
+               "  Esc steps back, Q leaves.\r\n\r\n");
+    door_write(CSI "1;37m  Press any key to start." CSI "0m");
+    if (door_read_char() < 0) return 0;
+    pix_lp_run(&caps, &g_prefs);
+    return 0;
+}
+
 static void draw_menu(int term, int recommended)
 {
     char line[32];
@@ -98,29 +181,61 @@ static void draw_menu(int term, int recommended)
     else
         door_write(CSI "1;30m  [1] TRACE graphics   (live map, mouse + keys) NOT FOUND (needs " CSI "1;35mTERM"
                    CSI "1;36minator" CSI "1;30m)\r\n");
-    door_write(CSI "1;37m  [2] ANSI 24-bit      " CSI "0;37m(any modern terminal)    " CSI "1;32mSUPPORTED\r\n\r\n");
+    if (g_cterm.jxl)
+        door_write(CSI "1;37m  [2] " CSI "1;32mJPEG XL" CSI "1;37m graphics " CSI "0;37m(live map, mouse + keys) "
+                   CSI "1;32mDETECTED\r\n");
+    else
+        door_write(g_cterm.old ? CSI "1;30m  [2] JPEG XL graphics (live map, mouse + keys) " CSI "1;33mUPDATE TERMINAL\r\n"
+                               : CSI "1;30m  [2] JPEG XL graphics (live map, mouse + keys) NOT FOUND\r\n");
+    door_write(CSI "1;37m  [3] ANSI 24-bit      " CSI "0;37m(any modern terminal)    " CSI "1;32mSUPPORTED\r\n\r\n");
     snprintf(line, sizeof(line), "[%d]", recommended);
     door_write(CSI "0;37m  Enter = " CSI "1;37m");
     door_write(line);
     door_write(CSI "0;37m     Q = back to the BBS " CSI "0m");
 }
 
+/* Menu keys 1-3 against the choices as the prefs keep them */
+static const int MENU_CHOICE[4] = { 0, CHOICE_TRACE, CHOICE_JXL, CHOICE_ANSI };
+
+/* A terminal's answer that arrives after detection gave up (a phone on a slow link) starts with Esc, which the menu
+ * would take as "leave": the door quit before the caller saw it (2026-10-11). A lone Esc still leaves; Esc followed at
+ * once by [ (CSI), _ (APC), P (DCS) or ] (OSC) is a late reply and is read to its end and ignored. */
+static int menu_esc_is_key(void)
+{
+    int c = door_read_char_timeout(80);
+    if (c < 0) return 1;                        /* nothing followed: the Esc key */
+    if (c == '[') {                             /* CSI: up to its final byte */
+        for (int i = 0; i < 64 && (c = door_read_char_timeout(300)) >= 0; i++)
+            if (c >= 0x40 && c <= 0x7E) break;
+    } else if (c == '_' || c == 'P' || c == ']') {   /* string: up to ST (Esc \\) or BEL */
+        int prev = 0;
+        for (int i = 0; i < 4096 && (c = door_read_char_timeout(300)) >= 0; i++) {
+            if (c == 7 || (prev == 27 && c == '\\')) break;
+            prev = c;
+        }
+    }
+    return 0;
+}
+
 static int choose_display(int term)
 {
-    bool trace = term == TERM_TRACE;
-    int recommended = trace ? CHOICE_TRACE : CHOICE_ANSI;
-    if (g_prefs.display == CHOICE_ANSI || (g_prefs.display == CHOICE_TRACE && trace))
-        recommended = g_prefs.display;
+    bool trace = term == TERM_TRACE, jxl = g_cterm.jxl;
+    int recommended = trace ? 1 : jxl ? 2 : 3;
+    if (g_prefs.display == CHOICE_ANSI) recommended = 3;
+    else if (g_prefs.display == CHOICE_TRACE && trace) recommended = 1;
+    else if (g_prefs.display == CHOICE_JXL && jxl) recommended = 2;
     for (;;) {
         draw_menu(term, recommended);
         int c = door_read_char();
+        if (c == 27 && !menu_esc_is_key()) continue;    /* a late terminal answer, not the Esc key */
         if (c < 0 || c == 'q' || c == 'Q' || c == 27) return 0;
         if (c == '\r' || c == '\n') c = '0' + recommended;
         if (c == '1' && !trace) continue;
-        if (c == '1' || c == '2') {
-            g_prefs.display = c - '0';
+        if (c == '2' && !jxl) continue;
+        if (c >= '1' && c <= '3') {
+            g_prefs.display = MENU_CHOICE[c - '0'];
             lp_save_prefs(&g_prefs);
-            return c - '0';
+            return g_prefs.display;
         }
     }
 }
@@ -155,145 +270,6 @@ static void send_packet(uint8_t type, uint8_t flags, uint16_t count, const void 
     tdoor_send("msg", buf, sizeof h + len);
 }
 
-static void node_wire(const LpNode *n, LpNodeWire *w)
-{
-    memset(w, 0, sizeof *w);
-    w->id = n->id;
-    w->lat1e5 = n->lat1e5;
-    w->lon1e5 = n->lon1e5;
-    w->firstHeard = n->firstHeard;
-    w->lastHeard = n->lastHeard;
-    w->voltage_cV = n->voltage_cV;
-    w->hw = n->hw;
-    w->battery = n->battery;
-    w->state = (uint8_t)lp_node_state(n);
-    w->flags = n->flags;
-    w->role = n->role;
-    w->humidity = n->humidity;
-    memcpy(w->name, n->name, LP_WIRE_NAME - 1);
-    memcpy(w->shortName, n->shortName, sizeof w->shortName - 1);
-    w->packets = n->packets;
-    w->temp_dC = (n->flags & LP_NODE_ENV) ? n->temp_dC : LP_NO_TEMP;
-    w->links = 0;                          /* the module counts them from the links it gets */
-}
-
-/* Links by index list (or all of them), in packets. Only the last day's. */
-static void send_links(const uint32_t *idx, uint32_t n, bool full)
-{
-    enum { PER = LP_MAX_PAYLOAD / sizeof(LpLinkWire) };
-    LpLinkWire w[PER];
-    uint32_t k = 0, now = (uint32_t)time(NULL);
-    bool first = full;
-    for (uint32_t i = 0; i <= n; i++) {
-        if (i == n || k == PER) {
-            if (k || first) send_packet(LP_IN_LINKS, first ? 1 : 0, (uint16_t)k, w, k * sizeof *w);
-            first = false;
-            k = 0;
-            if (i == n) break;
-        }
-        const LpLink *l = &lp_links[idx ? idx[i] : i];
-        if (now - l->lastHeard > 86400) continue;
-        LpLinkWire *o = &w[k++];
-        memset(o, 0, sizeof *o);
-        o->a = l->a;
-        o->b = l->b;
-        o->lastHeard = l->lastHeard;
-        o->snr_q = l->snr_q;
-        o->source = l->source;
-    }
-}
-
-static void send_history(void)
-{
-    unsigned char buf[sizeof(LpHistHead) + LP_HIST_MIN * 2];
-    LpHistHead h = { lp_histEnd, (uint16_t)lp_histCount, 0 };
-    memcpy(buf, &h, sizeof h);
-    memcpy(buf + sizeof h, lp_hist, lp_histCount * 2);
-    send_packet(LP_IN_HISTORY, 0, 1, buf, sizeof h + lp_histCount * 2);
-}
-
-/* Nodes by index list (or all of them when idx is NULL), in packets. */
-static void send_nodes(const uint32_t *idx, uint32_t n, bool full)
-{
-    enum { PER = LP_MAX_PAYLOAD / sizeof(LpNodeWire) };
-    LpNodeWire w[PER];
-    uint32_t k = 0;
-    bool first = full;
-    for (uint32_t i = 0; i <= n; i++) {
-        if (i == n || k == PER) {
-            if (k || first) send_packet(LP_IN_NODES, first ? 1 : 0, (uint16_t)k, w, k * sizeof *w);
-            first = false;
-            k = 0;
-            if (i == n) break;
-        }
-        node_wire(&lp_nodes[idx ? idx[i] : i], &w[k++]);
-    }
-    if (full) send_packet(LP_IN_DONE, 0, 0, NULL, 0);
-}
-
-static void send_chat(void)
-{
-    unsigned char buf[LP_MAX_PAYLOAD];
-    size_t used = 0;
-    uint16_t count = 0;
-    bool first = true;
-    for (uint32_t i = 0; i <= lp_nChat; i++) {
-        size_t need = 0;
-        const LpChat *c = i < lp_nChat ? &lp_chat[i] : NULL;
-        char name[LP_NAME_LEN] = "";
-        if (c) {
-            lp_label(lp_find(c->from), c->from, name, sizeof name);
-            need = sizeof(LpChatWire) + strlen(name) + strlen(c->channel) + strlen(c->text);
-        }
-        if (!c || used + need > LP_MAX_PAYLOAD) {
-            send_packet(LP_IN_CHAT, first ? 1 : 0, count, buf, used);
-            first = false;
-            used = 0;
-            count = 0;
-            if (!c) break;
-        }
-        LpChatWire w = { c->time, c->state, (uint8_t)strlen(name), (uint8_t)strlen(c->text), (uint8_t)strlen(c->channel) };
-        memcpy(buf + used, &w, sizeof w);
-        used += sizeof w;
-        memcpy(buf + used, name, w.nameLen); used += w.nameLen;
-        memcpy(buf + used, c->channel, w.chanLen); used += w.chanLen;
-        memcpy(buf + used, c->text, w.textLen); used += w.textLen;
-        count++;
-    }
-}
-
-static void send_stats(void)
-{
-    LpStats s;
-    memset(&s, 0, sizeof s);
-    s.doorNow = (uint32_t)time(NULL);
-    s.feed = (uint8_t)lp_feed_state();
-    s.startedAt = s.feed == LP_FEED_STOPPED ? 0 : lp_head.startedAt;
-    s.lastPacketAt = lp_head.lastPacketAt;
-    s.snapshotAt = lp_head.savedAt;
-    s.pktPerMin = s.feed == LP_FEED_LIVE ? lp_head.pktPerMin : 0;
-    s.nodesTotal = lp_nNodes;
-    s.firstEver = lp_firstEver ? 1 : 0;
-    send_packet(LP_IN_STATS, 0, 1, &s, sizeof s);
-}
-
-static void send_hello(void)
-{
-    LpHello h;
-    memset(&h, 0, sizeof h);
-    h.doorNow = (uint32_t)time(NULL);
-    h.region = (uint8_t)g_prefs.region;
-    h.nodeDays = (uint8_t)lp_config.nodeDays;
-    if (g_prefs.haveHome) {
-        h.haveHome = 1;
-        h.homeState = (uint8_t)g_prefs.homeState;
-        h.homeLat1e5 = (int32_t)lround(g_prefs.homeLat * 1e5);
-        h.homeLon1e5 = (int32_t)lround(g_prefs.homeLon * 1e5);
-        snprintf(h.homeName, sizeof h.homeName, "%.39s", g_prefs.homeName);
-    }
-    send_packet(LP_IN_HELLO, 0, 1, &h, sizeof h);
-}
-
 static void upload_progress(int percent)
 {
     char buf[96];
@@ -326,12 +302,7 @@ static int play_trace(void)
         if (reply == TDOOR_REPLY_CLOSED || !tdoor_is_open()) break;
         if (g_req.ready) {
             g_req.ready = false;
-            send_hello();
-            send_nodes(NULL, lp_nNodes, true);
-            send_links(NULL, lp_nLinks, true);
-            send_chat();
-            send_history();
-            send_stats();
+            link_send_all(send_packet, &g_prefs);
             started = true;
             lastPoll = lastStats = time(NULL);
         }
@@ -346,12 +317,7 @@ static int play_trace(void)
         lp_touch();
         if (started && now - lastPoll >= 2) {
             lastPoll = now;
-            LpChanges c = lp_refresh();
-            if (c.nodes) send_nodes(lp_changed, c.nodes, false);
-            if (c.links) send_links(lp_changedLinks, c.links, false);
-            if (c.chat) send_chat();
-            if (c.hist) send_history();
-            if (c.nodes || c.chat || now - lastStats >= 5) { send_stats(); lastStats = now; }
+            link_send_changes(send_packet, &lastStats);
         }
         if (door_time_remaining() <= 0) break;
     }
@@ -396,9 +362,11 @@ int main(int argc, char *argv[])
     lp_arrive();                           /* starts the collector now, so it warms up during the menu */
     lp_load_snapshot();
     int term = detect_terminal();
+    detect_cterm();                        /* always, TRACE or not: the menu shows both */
     int choice = choose_display(term);
     int status = 0;
     if (choice == CHOICE_TRACE) status = play_trace();
+    else if (choice == CHOICE_JXL) status = play_jxl();
     else if (choice == CHOICE_ANSI) ansi_lp_run(&g_prefs);
 
     lp_leave();

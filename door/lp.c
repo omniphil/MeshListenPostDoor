@@ -168,6 +168,16 @@ static const char *prefs_path(char *out, size_t size)
     return user_prefs(root, out, size, true);
 }
 
+const char *lp_user_file(const char *name, char *out, size_t size)
+{
+    char path[1400];
+    prefs_path(path, sizeof path);
+    char *slash = strrchr(path, '/');
+    if (slash) *slash = 0;
+    snprintf(out, size, "%s/%s", path, name);
+    return out;
+}
+
 /* The Weather door's prefs for this caller: only the town is taken. */
 static void weather_kv(const char *k, const char *v, void *ctx)
 {
